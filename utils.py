@@ -3,6 +3,7 @@ import random
 from typing import List
 
 import tensorflow as tf
+from keras_tuner import Hyperband
 from tqdm import tqdm
 from keras.src.callbacks import Callback
 from keras.src.layers import BatchNormalization
@@ -90,7 +91,7 @@ def generator_images(objs, batch_size, do_shuffle=False):
             yield images, labels
 
 
-def augmented_generation(objs, batch_size, do_shuffle=True, repeats=1, sigma = 10):
+def augmented_generation(objs, batch_size, do_shuffle=True, repeats=1, sigma = 10, tf_mode=False):
     if os.path.exists("images.npy"):
         print("Found preprocessed dataset - loading...", end="")
         images = np.load("images.npy", mmap_mode="r")
@@ -133,22 +134,73 @@ def augmented_generation(objs, batch_size, do_shuffle=True, repeats=1, sigma = 1
         labels = np.load("labels.npy", mmap_mode="r")
         print("Saved.")
 
-    while True:
-        indices = np.arange(len(images))  # Create an index array
+    if not tf_mode:
+        # images = images.astype(np.float32)
+        # np.save("images.npy", images)
+        # exit(0)
 
+        while True:
+            indices = np.arange(len(images))  # Create an index array
+
+            if do_shuffle:
+                np.random.shuffle(indices)  # Shuffle indices instead of images
+
+            num_batches_to_store = 4
+
+            # Process data in chunks of 10 batches
+            for chunk_start in range(0, len(images), batch_size * num_batches_to_store):
+                chunk_end = min(chunk_start + batch_size * num_batches_to_store, len(images))
+                chunk_indices = indices[chunk_start:chunk_end].copy()
+
+                # Retrieve all images for this chunk at once
+                chunk_images = images[chunk_indices].astype(np.float32)
+                chunk_labels = labels[chunk_indices]
+
+                # Apply noise to the entire chunk if needed
+                if sigma > 0:
+                    noise = np.random.normal(loc=0, scale=sigma, size=chunk_images.shape)
+                    chunk_images += noise
+
+                # Yield individual batches from the chunk
+                for i in range(0, len(chunk_indices), batch_size):
+                    batch_end = min(i + batch_size, len(chunk_indices))
+                    yield chunk_images[i:batch_end], chunk_labels[i:batch_end]
+    else:
+        buffer_size = 10000
+        dataset = tf.data.Dataset.from_tensor_slices((images, labels))
+
+        # Add shuffling if requested
         if do_shuffle:
-            np.random.shuffle(indices)  # Shuffle indices instead of images
+            dataset = dataset.shuffle(buffer_size=buffer_size)
 
-        for i in range(0, len(images), batch_size):
-            batch_indices = indices[i:i + batch_size].copy()
-            img_batch = images[batch_indices].copy()
-            if sigma > 0:
-                noise = np.random.normal(loc=0, scale=sigma, size=img_batch.shape)
-                img_batch = img_batch + noise
-            # print(img_batch.shape)
-            yield img_batch, labels[batch_indices]  # Fetch data using shuffled indices
+        # Add noise function if needed
+        if sigma > 0:
+            def add_noise(image, label):
+                noise = tf.random.normal(shape=tf.shape(image), mean=0.0, stddev=sigma, dtype=image.dtype)
+                return image + noise, label
+
+            dataset = dataset.map(add_noise, num_parallel_calls=tf.data.AUTOTUNE)
+
+        # Batch the data
+        dataset = dataset.batch(batch_size)
+
+        # Prefetch for performance
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        return dataset
 
 
+def train_val_split(batch_size=32, generated=True):
+    labels = [obj.objects[0].category for obj in ANNS]
+    anns_train, anns_valid = train_test_split(ANNS, test_size=0.1, random_state=1, shuffle=True, stratify=labels)
+    objs_train = [(ann.filename, obj) for ann in anns_train for obj in ann.objects]
+    objs_valid = [(ann.filename, obj) for ann in anns_valid for obj in ann.objects]
+    # Generators
+    if generated:
+        train_generator = augmented_generation(objs_train, batch_size, do_shuffle=True)
+    else:
+        train_generator = generator_images(objs_train, batch_size, do_shuffle=True)
+    valid_generator = generator_images(objs_valid, batch_size, do_shuffle=False)
+    return train_generator, valid_generator, len(objs_train), len(objs_valid)
 # def augment_image(image, crop_ratio=0.8):
 #     """
 #     Augments a single image by applying rotations and center crops.
@@ -307,32 +359,30 @@ def build_fcnn(hp):
     model.add(Flatten(input_shape=(224, 224, 3)))
 
     # Tune number of layers
-    num_layers = hp.Int('num_layers', min_value=2, max_value=3, step=1)
+    num_layers = hp.Int('num_layers', min_value=3, max_value=4, step=1)
 
     for i in range(num_layers):
         # Tune number of neurons
-        neurons = hp.Int(f'neurons_{i}', min_value=128, max_value=1024, step=128)
+        neurons = hp.Int(f'neurons_{i}', min_value=512, max_value=1024, step=128)
 
         # Tune regularization
-        reg_type = hp.Choice(f'reg_type_{i}', values=['none', 'l1', 'l2', 'l1_l2'])
-        if reg_type == 'none':
-            reg = None
-        elif reg_type == 'l1':
+        l1_value = hp.Float(f'l1_{i}', min_value=1e-4, max_value=1e-1, sampling='log')
+        l2_value = hp.Float(f'l2_{i}', min_value=1e-4, max_value=1e-1, sampling='log')
+
+        if l1_value > 0 and l2_value == 0:
             l1_value = hp.Float(f'l1_{i}', min_value=1e-4, max_value=1e-1, sampling='log')
             reg = regularizers.l1(l1_value)
-        elif reg_type == 'l2':
+        elif l1_value == 0 and l2_value > 0:
             l2_value = hp.Float(f'l2_{i}', min_value=1e-4, max_value=1e-1, sampling='log')
             reg = regularizers.l2(l2_value)
-        else:  # 'l1_l2'
-            l1_value = hp.Float(f'l1_combined_{i}', min_value=1e-4, max_value=1e-1, sampling='log')
-            l2_value = hp.Float(f'l2_combined_{i}', min_value=1e-4, max_value=1e-1, sampling='log')
+        elif l1_value > 0 and l2_value > 0:
             reg = regularizers.l1_l2(l1=l1_value, l2=l2_value)
 
         # Tune activation function
-        activation = hp.Choice(f'activation_{i}', values=['relu', 'elu', 'selu', 'tanh'])
+        activation = hp.Choice(f'activation_{i}', values=['leaky_relu', 'elu'])
 
         # Tune initialization
-        init_type = hp.Choice(f'init_{i}', values=['he', 'glorot', 'random'])
+        init_type = hp.Choice(f'init_{i}', values=['he', 'glorot'])
         if init_type == 'he':
             init = initializers.HeNormal()
         elif init_type == 'glorot':
@@ -351,7 +401,7 @@ def build_fcnn(hp):
         model.add(Activation(activation))
 
         # Tune dropout rate
-        dropout_rate = hp.Float(f'dropout_{i}', min_value=0.0, max_value=0.5, step=0.1)
+        dropout_rate = hp.Float(f'dropout_{i}', min_value=0.0, max_value=0.4, step=0.1)
         if dropout_rate > 0:
             model.add(Dropout(dropout_rate))
 
@@ -380,15 +430,7 @@ def build_fcnn(hp):
     return model
 
 
-def train_val_split(batch_size=32):
-    labels = [obj.objects[0].category for obj in ANNS]
-    anns_train, anns_valid = train_test_split(ANNS, test_size=0.1, random_state=1, shuffle=True, stratify=labels)
-    objs_train = [(ann.filename, obj) for ann in anns_train for obj in ann.objects]
-    objs_valid = [(ann.filename, obj) for ann in anns_valid for obj in ann.objects]
-    # Generators
-    train_generator = generator_images(objs_train, batch_size, do_shuffle=True) # augmented_generation(objs_train, batch_size, do_shuffle=True)
-    valid_generator = generator_images(objs_valid, batch_size, do_shuffle=False)
-    return train_generator, valid_generator, len(objs_train), len(objs_valid)
+
 
 
 import time
@@ -420,7 +462,7 @@ class HyperbandCheckpointCallback(Callback):
     Custom callback to save the best hyperparameters found so far during Hyperband search.
     """
 
-    def __init__(self, tuner, save_dir='hyperband_checkpoints'):
+    def __init__(self, tuner: Hyperband, save_dir='hyperband_checkpoints'):
         super().__init__()
         self.tuner = tuner
         self.save_dir = save_dir
@@ -441,19 +483,17 @@ class HyperbandCheckpointCallback(Callback):
                 self.best_val_accuracy = current_val_accuracy
 
                 # Get the current trial's hyperparameters
-                current_trial = self.tuner.oracle.trials[self.tuner.oracle.ongoing_trials[0]]
-                hyperparameters = current_trial.hyperparameters.values
+                hyperparameters = self.tuner.get_best_hyperparameters()
 
                 # Create a dict with all relevant information
                 checkpoint_data = {
-                    'trial_id': current_trial.trial_id,
                     'val_accuracy': current_val_accuracy,
                     'epoch': epoch,
                     'hyperparameters': hyperparameters
                 }
 
                 # Save to file
-                filename = f"trial_{current_trial.trial_id}_acc_{current_val_accuracy}_epoch_{epoch}.json"
+                filename = f"trial_acc_{current_val_accuracy}_epoch_{epoch}.json"
                 checkpoint_file = os.path.join(self.save_dir, filename)
                 with open(checkpoint_file, 'w') as f:
                     json.dump(checkpoint_data, f, indent=2)
@@ -486,7 +526,7 @@ if __name__ == "__main__":
 
     callbacks = callbacks + [TimingCallback(), HistorySaverCallback()]
 
-    batch_size = 32
+    batch_size = 256
     train_generator, valid_generator, sz_train, sz_val = train_val_split(batch_size=batch_size)
     epochs = 80
     train_steps = math.ceil(sz_train / batch_size)
