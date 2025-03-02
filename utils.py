@@ -359,11 +359,11 @@ def build_fcnn(hp):
     model.add(Flatten(input_shape=(224, 224, 3)))
 
     # Tune number of layers
-    num_layers = hp.Int('num_layers', min_value=3, max_value=4, step=1)
+    num_layers = hp.Int('num_layers', min_value=3, max_value=3, step=1)
 
     for i in range(num_layers):
         # Tune number of neurons
-        neurons = hp.Int(f'neurons_{i}', min_value=512, max_value=1024, step=128)
+        neurons = hp.Int(f'neurons_{i}', min_value=512, max_value=1024, step=64)
 
         # Tune regularization
         l1_value = hp.Float(f'l1_{i}', min_value=1e-4, max_value=1e-1, sampling='log')
