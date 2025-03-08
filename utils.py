@@ -1,5 +1,8 @@
+import multiprocessing
 import os
 import random
+import re
+import subprocess
 from typing import List
 
 import tensorflow as tf
@@ -10,7 +13,8 @@ from keras.src.layers import BatchNormalization
 from keras.src.optimizers import Adam
 from sklearn.model_selection import train_test_split
 
-from config import CATEGORIES, JSON_DATA, ANNS, COUNTS
+import config
+from config import CATEGORIES, JSON_DATA, ANNS, COUNTS, DATA_DIR
 import cv2
 import json
 import uuid
@@ -73,29 +77,11 @@ def load_geoimage(filename):
         img[:, :, band] = src_raster.read(band+1)
     return img
 
-def generator_images(objs, batch_size, do_shuffle=False):
-    while True:
-        if do_shuffle:
-            np.random.shuffle(objs)
-        groups = [objs[i:i+batch_size] for i in range(0, len(objs), batch_size)]
-        for group in groups:
-            images, labels = [], []
-            for (filename, obj) in group:
-                # Load image
-                images.append(load_geoimage(filename))
-                probabilities = np.zeros(len(CATEGORIES))
-                probabilities[list(CATEGORIES.values()).index(obj.category)] = 1
-                labels.append(probabilities)
-            images = np.array(images).astype(np.float32)
-            labels = np.array(labels).astype(np.float32)
-            yield images, labels
-
-
-def augmented_generation(objs, batch_size, do_shuffle=True, repeats=1, sigma = 10, tf_mode=False):
-    if os.path.exists("images.npy"):
+def generator_images(objs, batch_size, mem_map=False, tf_mode=True):
+    if os.path.isfile(os.path.join(DATA_DIR, "val_images.npy")):
         print("Found preprocessed dataset - loading...", end="")
-        images = np.load("images.npy", mmap_mode="r")
-        labels = np.load("labels.npy", mmap_mode="r")
+        images = np.load(os.path.join(DATA_DIR, "val_images.npy"), mmap_mode="r" if mem_map else None)
+        labels = np.load(os.path.join(DATA_DIR, "val_labels.npy"), mmap_mode="r" if mem_map else None)
         print("done.")
     else:
         # Your existing processing code goes here
@@ -103,152 +89,172 @@ def augmented_generation(objs, batch_size, do_shuffle=True, repeats=1, sigma = 1
         for obj in tqdm(objs, desc="Processing images"):
             filename, obj = obj
             image = load_geoimage(filename)
-            (h, w) = image.shape[:2]
-            center = (w // 2, h // 2)
-
-            for k in range(repeats):
-                for angle in [0, 90, 180, 270]:
-                    if repeats > 1:
-                        # Rotate by a small random angle (e.g., between -2 and 2 degrees)
-                        angle = angle + random.uniform(-5, 5)
-                        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                        t_image = cv2.warpAffine(image, M, (w, h))
-
-                        # Crop a small margin from the edges (adjust the margin as needed)
-                        margin = int(round(random.uniform(0, 10)))  # number of pixels to crop from each side
-                        t_image = t_image[margin:h - margin, margin:w - margin, :]
-                        t_image = cv2.resize(t_image, (w, h), interpolation=cv2.INTER_LINEAR)
-                    else:
-                        t_image = image
-                    images.append(t_image)
-                    probabilities = np.zeros(len(CATEGORIES))
-                    probabilities[list(CATEGORIES.values()).index(obj.category)] = 1
-                    labels.append(probabilities)
+            images.append(np.array(image, dtype=np.uint8))
+            probabilities = np.zeros(len(CATEGORIES), dtype=np.uint8)
+            probabilities[list(CATEGORIES.values()).index(obj.category)] = 1
+            labels.append(probabilities)
 
         images = np.array(images)
-        labels = np.array(labels).astype(np.float32)
+        labels = np.array(labels)
+        print(f"Space required as uint8: {images.nbytes / 2 ** 30}GB")
+        print(f"Space required before uint8: {images.nbytes / 2 ** 30}GB")
 
-        np.save("images.npy", images)
-        np.save("labels.npy", labels)
-        images = np.load("images.npy", mmap_mode="r")
-        labels = np.load("labels.npy", mmap_mode="r")
+        os.makedirs(DATA_DIR, exist_ok=True)
+        np.save(os.path.join(DATA_DIR, "val_images.npy"), images)
+        np.save(os.path.join(DATA_DIR, "val_labels.npy"), labels)
+        if mem_map:
+            images = np.load(os.path.join(DATA_DIR, "val_images.npy"), mmap_mode="r")
+            labels = np.load(os.path.join(DATA_DIR, "val_labels.npy"), mmap_mode="r")
         print("Saved.")
 
     if not tf_mode:
-        # images = images.astype(np.float32)
-        # np.save("images.npy", images)
-        # exit(0)
-
-        while True:
-            indices = np.arange(len(images))  # Create an index array
-
-            if do_shuffle:
-                np.random.shuffle(indices)  # Shuffle indices instead of images
-
-            num_batches_to_store = 4
-
-            # Process data in chunks of 10 batches
-            for chunk_start in range(0, len(images), batch_size * num_batches_to_store):
-                chunk_end = min(chunk_start + batch_size * num_batches_to_store, len(images))
-                chunk_indices = indices[chunk_start:chunk_end].copy()
-
-                # Retrieve all images for this chunk at once
-                chunk_images = images[chunk_indices].astype(np.float32)
-                chunk_labels = labels[chunk_indices]
-
-                # Apply noise to the entire chunk if needed
-                if sigma > 0:
-                    noise = np.random.normal(loc=0, scale=sigma, size=chunk_images.shape)
-                    chunk_images += noise
-
-                # Yield individual batches from the chunk
-                for i in range(0, len(chunk_indices), batch_size):
-                    batch_end = min(i + batch_size, len(chunk_indices))
-                    yield chunk_images[i:batch_end], chunk_labels[i:batch_end]
+        raise ValueError("Pythons generators are disabled due to a bug in Python's generator detection.")
+        # while True:
+        #     indices = np.arange(len(images))  # Create an index array
+        #
+        #     num_batches_to_store = max(512 // batch_size, 1)
+        #
+        #     # Process data in chunks of 10 batches
+        #     for chunk_start in range(0, len(images), batch_size * num_batches_to_store):
+        #         chunk_end = min(chunk_start + batch_size * num_batches_to_store, len(images))
+        #         chunk_indices = indices[chunk_start:chunk_end].copy()
+        #
+        #         # Retrieve all images for this chunk at once
+        #         chunk_images = images[chunk_indices]
+        #         chunk_labels = labels[chunk_indices]
+        #         chunk_images = chunk_images.astype(np.float32)
+        #
+        #         # Yield individual batches from the chunk
+        #         for i in range(0, len(chunk_images), batch_size):
+        #             batch_end = min(i + batch_size, len(chunk_images))
+        #             yield chunk_images[i:batch_end].astype(np.float32), chunk_labels[i:batch_end]
     else:
-        buffer_size = 10000
         dataset = tf.data.Dataset.from_tensor_slices((images, labels))
 
-        # Add shuffling if requested
-        if do_shuffle:
-            dataset = dataset.shuffle(buffer_size=buffer_size)
-
-        # Add noise function if needed
-        if sigma > 0:
-            def add_noise(image, label):
-                noise = tf.random.normal(shape=tf.shape(image), mean=0.0, stddev=sigma, dtype=image.dtype)
-                return image + noise, label
-
-            dataset = dataset.map(add_noise, num_parallel_calls=tf.data.AUTOTUNE)
-
-        # Batch the data
+        # Batch the dataset
         dataset = dataset.batch(batch_size)
 
-        # Prefetch for performance
+        # Repeat indefinitely (similar to while True:)
+        dataset = dataset.repeat()
+
+        # Prefetch for improved performance
         dataset = dataset.prefetch(tf.data.AUTOTUNE)
         return dataset
 
 
-def train_val_split(batch_size=32, generated=True):
+
+def augmented_generation(objs, batch_size, do_shuffle=True, sigma=10, color_noise=3, margin_noise=10, mem_map=False, tf_mode=True):
+    print(DATA_DIR)
+    print(os.path.join(DATA_DIR, "images.npy"))
+
+    if os.path.isfile(os.path.join(DATA_DIR, "images.npy")):
+        print("Found preprocessed dataset - loading...", end="")
+        images = np.load(os.path.join(DATA_DIR, "images.npy"), mmap_mode="r" if mem_map else None)
+        labels = np.load(os.path.join(DATA_DIR, "labels.npy"), mmap_mode="r" if mem_map else None)
+        print("done.")
+    else:
+        # Your existing processing code goes here
+        images, labels = [], []
+        for obj in tqdm(objs, desc="Processing images"):
+            filename, obj = obj
+            image = load_geoimage(filename)
+            images.append(np.array(image, dtype=np.uint8))
+            probabilities = np.zeros(len(CATEGORIES), dtype=np.uint8)
+            probabilities[list(CATEGORIES.values()).index(obj.category)] = 1
+            labels.append(probabilities)
+
+        images = np.array(images)
+        labels = np.array(labels)
+        print(f"Space required as uint8: {images.nbytes / 2**30}GB")
+        print(f"Space required before uint8: {images.nbytes / 2**30}GB")
+
+
+        os.makedirs(DATA_DIR, exist_ok=True)
+        np.save(os.path.join(DATA_DIR, "images.npy"), images)
+        np.save(os.path.join(DATA_DIR, "labels.npy"), labels)
+        if mem_map:
+            images = np.load(os.path.join(DATA_DIR, "images.npy"), mmap_mode="r")
+            labels = np.load(os.path.join(DATA_DIR, "labels.npy"), mmap_mode="r")
+        print("Saved.")
+
+
+    if not tf_mode:
+        raise ValueError("Pythons generators are disabled due to a bug in Python's generator detection.")
+        # while True:
+        #     indices = np.arange(len(images))  # Create an index array
+        #
+        #     if do_shuffle:
+        #         np.random.shuffle(indices)  # Shuffle indices instead of images
+        #
+        #     num_batches_to_store = max(512 // batch_size, 1)
+        #     (h, w) = images.shape[:2]
+        #     center = (w // 2, h // 2)
+        #
+        #     # Process data in chunks of 10 batches
+        #     for chunk_start in range(0, len(images), batch_size * num_batches_to_store):
+        #         chunk_end = min(chunk_start + batch_size * num_batches_to_store, len(images))
+        #         chunk_indices = indices[chunk_start:chunk_end].copy()
+        #
+        #         # Retrieve all images for this chunk at once
+        #         chunk_images = images[chunk_indices]
+        #         chunk_labels = labels[chunk_indices]
+        #
+        #         # Apply noise to the entire chunk if needed
+        #         chunk_images += np.random.uniform(0, 2 * color_noise, size=chunk_images.shape).astype(np.uint8)
+        #         chunk_images -= np.ones(chunk_images.shape, dtype=np.uint8) * color_noise
+        #
+        #         chunk_images = np.rot90(chunk_images, k=np.random.choice([0,1,2,3]), axes=(1, 2))
+        #         chunk_images = chunk_images.astype(np.float32)
+        #
+        #         # Yield individual batches from the chunk
+        #         for i in range(0, len(chunk_images), batch_size):
+        #             batch_end = min(i + batch_size, len(chunk_images))
+        #             yield chunk_images[i:batch_end].astype(np.float32), chunk_labels[i:batch_end]
+    else:
+        dataset = tf.data.Dataset.from_tensor_slices((images, labels))
+
+        if do_shuffle:
+            dataset = dataset.shuffle(buffer_size=len(images))
+
+        def preprocess(image, label):
+            # Convert the image to float32 (if not already)
+            image = tf.cast(image, tf.float32)
+
+            # Add noise: equivalent to (image + uniform(0, 2*color_noise) - color_noise)
+            noise = tf.random.uniform(shape=tf.shape(image),
+                                      minval=0, maxval=2 * color_noise,
+                                      dtype=tf.float32)
+            image = image + noise - color_noise
+
+            # Apply a random rotation (0, 90, 180, or 270 degrees)
+            k = tf.random.uniform(shape=[], minval=0, maxval=4, dtype=tf.int32)
+            image = tf.image.rot90(image, k=k)
+
+            return image, label
+
+        # Apply the preprocessing transformation in parallel
+        dataset = dataset.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+
+        # Batch the dataset
+        dataset = dataset.batch(batch_size)
+
+        # Repeat indefinitely (similar to while True:)
+        dataset = dataset.repeat()
+
+        # Prefetch for improved performance
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        return dataset
+
+
+def train_val_split(train_batch=32, val_batch=512):
     labels = [obj.objects[0].category for obj in ANNS]
     anns_train, anns_valid = train_test_split(ANNS, test_size=0.1, random_state=1, shuffle=True, stratify=labels)
     objs_train = [(ann.filename, obj) for ann in anns_train for obj in ann.objects]
     objs_valid = [(ann.filename, obj) for ann in anns_valid for obj in ann.objects]
     # Generators
-    if generated:
-        train_generator = augmented_generation(objs_train, batch_size, do_shuffle=True)
-    else:
-        train_generator = generator_images(objs_train, batch_size, do_shuffle=True)
-    valid_generator = generator_images(objs_valid, batch_size, do_shuffle=False)
+    train_generator = augmented_generation(objs_train, train_batch, do_shuffle=True)
+    valid_generator = generator_images(objs_valid, val_batch)
     return train_generator, valid_generator, len(objs_train), len(objs_valid)
-# def augment_image(image, crop_ratio=0.8):
-#     """
-#     Augments a single image by applying rotations and center crops.
-#
-#     Parameters:
-#         image (np.array): The input image array.
-#         crop_ratio (float): The fraction of the image to keep when cropping (default 0.8).
-#
-#     Returns:
-#         List[np.array]: A list of augmented image arrays.
-#     """
-#     augmented = []
-#     # Apply rotations: 0, 90, 180, 270 degrees.
-#     for k in range(4):
-#         # Rotate the image by 90 degrees k times.
-#         rotated = np.rot90(image, k=k)
-#         augmented.append(rotated)
-#
-#         # Compute dimensions for center crop.
-#         h, w = rotated.shape[:2]
-#         crop_h, crop_w = int(crop_ratio * h), int(crop_ratio * w)
-#         start_y, start_x = (h - crop_h) // 2, (w - crop_w) // 2
-#         cropped = rotated[start_y:start_y + crop_h, start_x:start_x + crop_w]
-#         augmented.append(cropped)
-#     return augmented
-#
-#
-# def augment_batch(images, labels, crop_ratio=0.8):
-#     """
-#     Augments a batch of images and duplicates the labels accordingly.
-#
-#     Parameters:
-#         images (List[np.array]): List or array of images.
-#         labels (List[np.array]): List or array of corresponding labels.
-#         crop_ratio (float): The fraction of the image to keep when cropping.
-#
-#     Returns:
-#         Tuple[np.array, np.array]: Augmented images and labels.
-#     """
-#     aug_images = []
-#     aug_labels = []
-#     for img, lab in zip(images, labels):
-#         augmented_imgs = augment_image(img, crop_ratio)
-#         aug_images.extend(augmented_imgs)
-#         aug_labels.extend([lab] * len(augmented_imgs))
-#     return np.array(aug_images, dtype=np.float32), np.array(aug_labels, dtype=np.float32)
-
-
 
 def draw_confusion_matrix(cm, categories):
     # Draw confusion matrix
@@ -348,7 +354,7 @@ def generate_fcnn_model(layers : List[LayerSettings]=(),
             model.add(Dropout(settings.dropout))
 
     model.add(Dense(len(CATEGORIES), activation='softmax'))
-    model_name = "Out"
+    model_name += "Out"
     # Learning rate is changed to 0.001
     model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy', 'precision', 'f1_score'])
     return model, model_name
@@ -508,38 +514,53 @@ class HyperbandCheckpointCallback(Callback):
 
 if __name__ == "__main__":
     import math
-
-    layers = [
-        LayerSettings(512, ('l2', 0.01), 'relu', 'he', 0.2, True),
-        LayerSettings(512, ('l2', 0.01), 'relu', 'he', 0.2, True),
-        LayerSettings(512, ('l2', 0.01), 'relu', 'he', 0.2, True)
-    ]
-    model, name = generate_fcnn_model(layers)
-
+    import gc
     from tensorflow.keras.callbacks import TerminateOnNaN, EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+    from keras_tuner import BayesianOptimization
+    from tensorflow.keras.callbacks import ModelCheckpoint
 
-    model_checkpoint = ModelCheckpoint(f'{name}.keras', monitor='val_accuracy', verbose=1, save_best_only=True)
-    reduce_lr = ReduceLROnPlateau('val_accuracy', factor=0.1, patience=10, verbose=1)
-    early_stop = EarlyStopping('val_accuracy', patience=40, verbose=1)
-    terminate = TerminateOnNaN()
-    callbacks = [model_checkpoint, reduce_lr, early_stop, terminate]
-
-    callbacks = callbacks + [TimingCallback(), HistorySaverCallback()]
-
+    # Run the hyperparameter search
     batch_size = 256
-    train_generator, valid_generator, sz_train, sz_val = train_val_split(batch_size=batch_size)
-    epochs = 80
+    train_generator, valid_generator, sz_train, sz_val = train_val_split(train_batch=batch_size)
     train_steps = math.ceil(sz_train / batch_size)
     valid_steps = math.ceil(sz_val / batch_size)
-    h = model.fit(train_generator,
-                  steps_per_epoch=train_steps,
-                  validation_data=valid_generator,
-                  validation_steps=valid_steps,
-                  epochs=epochs,
-                  callbacks=callbacks,
-                  verbose=1,
-                  )
-    # Best validation model
-    best_idx = int(np.argmax(h.history['val_accuracy']))
-    best_value = np.max(h.history['val_accuracy'])
-    print('Best validation model: epoch ' + str(best_idx + 1), ' - val_accuracy ' + str(best_value))
+
+    # Set up Bayesian Optimizer
+    tuner = BayesianOptimization(
+        build_fcnn,
+        objective='val_accuracy',
+        max_trials=20,  # Number of total trials to run
+        directory='bayesian_search',
+        project_name='fcnn_tuning',
+        overwrite=True,
+        max_model_size=1_000_000_000,
+        max_consecutive_failed_trials=2,
+        executions_per_trial=1  # Disallow parallel execution
+    )
+
+    # Define callback for the search
+    early_stop_tuner = EarlyStopping(
+        monitor='val_accuracy',
+        patience=5,
+        restore_best_weights=True
+    )
+    os.makedirs("kaggle/tmp", exist_ok=True)
+    checkpoint = ModelCheckpoint(
+        '/kaggle/tmp/best_model_only.weights.h5',
+        monitor='val_accuracy',
+        save_best_only=True,  # Only save when model improves
+        save_weights_only=True  # Save just weights, not full model
+    )
+    tuner.search(
+        train_generator,
+        steps_per_epoch=train_steps,
+        validation_data=valid_generator,
+        validation_steps=valid_steps,
+        epochs=25,
+        callbacks=[early_stop_tuner, checkpoint]
+    )
+
+    # Get the best hyperparameters
+    best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+
+    exit(0)
