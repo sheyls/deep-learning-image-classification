@@ -1,11 +1,12 @@
-import multiprocessing
 import os
-import random
-import re
-import subprocess
 from typing import List
 
 import tensorflow as tf
+os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    tf.config.experimental.set_memory_growth(physical_devices[0], True)
+
 from keras_tuner import Hyperband
 from tqdm import tqdm
 from keras.src.callbacks import Callback
@@ -49,7 +50,6 @@ class GenericImage:
 
     def add_object(self, obj: GenericObject):
         self.objects.append(obj)
-
 
 
 for json_img, json_ann in zip(JSON_DATA['images'].values(), JSON_DATA['annotations'].values()):
@@ -359,8 +359,8 @@ def generate_fcnn_model(layers : List[LayerSettings]=(),
     model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy', 'precision', 'f1_score'])
     return model, model_name
 
+
 def build_fcnn(hp):
-    # First, define a model-building function for Hyperband
     model = Sequential()
     model.add(Flatten(input_shape=(224, 224, 3)))
 
@@ -451,66 +451,6 @@ class TimingCallback(tf.keras.callbacks.Callback):
         print(f"\nEpoch {epoch + 1} took {duration:.2f} seconds\n")
 
 
-class HistorySaverCallback(tf.keras.callbacks.Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        if not hasattr(self, 'history_data'):
-            self.history_data = []
-        self.history_data.append(logs)
-
-    def on_train_end(self, logs=None):
-        # Save the history to a JSON file at the end of training
-        with open('training_history.json', 'w') as f:
-            json.dump(self.history_data, f)
-
-
-class HyperbandCheckpointCallback(Callback):
-    """
-    Custom callback to save the best hyperparameters found so far during Hyperband search.
-    """
-
-    def __init__(self, tuner: Hyperband, save_dir='hyperband_checkpoints'):
-        super().__init__()
-        self.tuner = tuner
-        self.save_dir = save_dir
-        self.best_val_accuracy = 0
-        self.trial_count = 0
-
-        # Create the directory if it doesn't exist
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-
-    def on_epoch_end(self, epoch, logs=None):
-        """Save the current best hyperparameters at the end of each epoch"""
-        if logs and 'val_accuracy' in logs:
-            current_val_accuracy = logs['val_accuracy']
-
-            # If this is a new best model
-            if current_val_accuracy > self.best_val_accuracy:
-                self.best_val_accuracy = current_val_accuracy
-
-                # Get the current trial's hyperparameters
-                hyperparameters = self.tuner.get_best_hyperparameters()
-
-                # Create a dict with all relevant information
-                checkpoint_data = {
-                    'val_accuracy': current_val_accuracy,
-                    'epoch': epoch,
-                    'hyperparameters': hyperparameters
-                }
-
-                # Save to file
-                filename = f"trial_acc_{current_val_accuracy}_epoch_{epoch}.json"
-                checkpoint_file = os.path.join(self.save_dir, filename)
-                with open(checkpoint_file, 'w') as f:
-                    json.dump(checkpoint_data, f, indent=2)
-
-                print(f"\nNew best hyperparameters found! Val accuracy: {current_val_accuracy:.4f}")
-                print(f"Saved to {checkpoint_file}")
-
-    def on_train_begin(self, logs=None):
-        """Log the start of a new trial"""
-        self.trial_count += 1
-        print(f"\nStarting trial {self.trial_count}")
 
 if __name__ == "__main__":
     import math
@@ -518,6 +458,8 @@ if __name__ == "__main__":
     from tensorflow.keras.callbacks import TerminateOnNaN, EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
     from keras_tuner import BayesianOptimization
     from tensorflow.keras.callbacks import ModelCheckpoint
+
+
 
     # Run the hyperparameter search
     batch_size = 256
@@ -529,11 +471,11 @@ if __name__ == "__main__":
     tuner = BayesianOptimization(
         build_fcnn,
         objective='val_accuracy',
-        max_trials=20,  # Number of total trials to run
+        max_trials=60,  # Number of total trials to run
         directory='bayesian_search',
         project_name='fcnn_tuning',
         overwrite=True,
-        max_model_size=1_000_000_000,
+        # max_model_size=1_000_000_000,
         max_consecutive_failed_trials=2,
         executions_per_trial=1  # Disallow parallel execution
     )
@@ -544,20 +486,13 @@ if __name__ == "__main__":
         patience=5,
         restore_best_weights=True
     )
-    os.makedirs("kaggle/tmp", exist_ok=True)
-    checkpoint = ModelCheckpoint(
-        '/kaggle/tmp/best_model_only.weights.h5',
-        monitor='val_accuracy',
-        save_best_only=True,  # Only save when model improves
-        save_weights_only=True  # Save just weights, not full model
-    )
     tuner.search(
         train_generator,
         steps_per_epoch=train_steps,
         validation_data=valid_generator,
         validation_steps=valid_steps,
         epochs=25,
-        callbacks=[early_stop_tuner, checkpoint]
+        callbacks=[early_stop_tuner]
     )
 
     # Get the best hyperparameters
